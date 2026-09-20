@@ -229,6 +229,43 @@
   .legend dt { font-weight: 600; color: var(--text); margin-top: 6px; }
   .legend dd { margin: 0 0 2px; }
 
+  .inst-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .inst-btn {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    padding: 7px 9px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    line-height: 1.35;
+  }
+  .inst-btn:hover { background: var(--panel-2); border-color: var(--line); }
+  .inst-dot {
+    flex: 0 0 auto;
+    width: 14px; height: 14px;
+    margin-top: 3px;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.35);
+  }
+  .inst-name { font-size: 13px; font-weight: 600; }
+  .inst-hue {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    margin-left: 5px;
+  }
+  .inst-desc { display: block; font-size: 11px; color: var(--text-dim); }
+
   .sr-only {
     position: absolute; width: 1px; height: 1px;
     padding: 0; margin: -1px; overflow: hidden;
@@ -325,15 +362,26 @@
       <canvas id="scopeCanvas" width="600" height="180" aria-hidden="true"></canvas>
     </section>
 
+    <section class="panel" aria-labelledby="inst-heading">
+      <h2 id="inst-heading">악기 — 색 영역별</h2>
+      <p class="legend" style="margin-bottom:10px">
+        색상환을 8개 영역으로 나눠 각각 다른 악기를 배정했습니다.
+        항목을 누르면 그 악기의 색으로 그릴 수 있습니다.
+      </p>
+      <ul class="inst-list" id="instList"></ul>
+    </section>
+
     <section class="panel" aria-labelledby="map-heading">
       <h2 id="map-heading">매핑 규칙</h2>
       <dl class="legend">
+        <dt>Hue → 악기</dt>
+        <dd>색상환 8개 영역이 각각 고유한 합성 음색을 담당</dd>
         <dt>Hue → 음높이</dt>
         <dd>0°~360°를 선택한 스케일 3옥타브(C3~C6)에 인덱스로 정규화</dd>
         <dt>Brightness → 음량</dt>
         <dd>gain = 0.05 + (brightness / 255) × 0.35</dd>
-        <dt>Saturation → 음색</dt>
-        <dd>&gt;66% sawtooth · 33~66% triangle · &lt;33% sine</dd>
+        <dt>Saturation → 음색 밝기</dt>
+        <dd>저역통과 컷오프를 조절 — 채도 높음: 밝고 선명, 낮음: 부드럽고 둔탁</dd>
         <dt>열 위치 → 시간</dt>
         <dd>start = currentTime + col × stepDuration (48열)</dd>
       </dl>
@@ -756,6 +804,275 @@ class ImageAnalyzer {
 }
 
 /* =====================================================================
+ * InstrumentBank — 색 영역(Hue 구간)별 악기 음색
+ *
+ * 색상환을 8개 영역으로 나누고 각 영역에 고유한 악기를 배정한다.
+ * 모든 음색은 OscillatorNode / GainNode / BiquadFilterNode 조합으로
+ * 직접 합성한다(외부 샘플·라이브러리 없음 — CSP 제약 유지).
+ * ===================================================================== */
+
+/** 한 음(보이스)을 구성하는 노드 묶음. 생성·정지·해제를 함께 관리한다. */
+class Voice {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.out = ctx.createGain();   // 엔벨로프 담당 게인
+    this.out.gain.value = 0;
+    this.sources = [];             // stop()이 필요한 오실레이터·LFO
+    this.nodes = [this.out];       // disconnect()가 필요한 전체 노드
+  }
+
+  osc(type, freq, detune, start, end) {
+    const o = this.ctx.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, start);
+    if (detune) o.detune.setValueAtTime(detune, start);
+    o.start(start);
+    o.stop(end);
+    this.sources.push(o);
+    return o;
+  }
+
+  gain(value) {
+    const g = this.ctx.createGain();
+    g.gain.value = value;
+    this.nodes.push(g);
+    return g;
+  }
+
+  lowpass(freq, q) {
+    const f = this.ctx.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.value = freq;
+    if (q != null) f.Q.value = q;
+    this.nodes.push(f);
+    return f;
+  }
+
+  /** 비브라토 LFO를 대상 오실레이터들의 detune에 연결 */
+  vibrato(targets, rate, cents, start, end) {
+    const lfo = this.ctx.createOscillator();
+    lfo.type = "sine";
+    lfo.frequency.value = rate;
+    const depth = this.gain(cents);
+    lfo.connect(depth);
+    for (const t of targets) depth.connect(t.detune);
+    lfo.start(start);
+    lfo.stop(end);
+    this.sources.push(lfo);
+  }
+
+  /** 즉시 묵음화 후 모든 소스 정지 */
+  silence(now) {
+    try {
+      this.out.gain.cancelScheduledValues(now);
+      this.out.gain.setValueAtTime(0.0001, now);
+    } catch (_) {}
+    for (const src of this.sources) {
+      try { src.onended = null; src.stop(now); } catch (_) {}
+    }
+  }
+
+  dispose() {
+    for (const src of this.sources) { try { src.disconnect(); } catch (_) {} }
+    for (const nd of this.nodes) { try { nd.disconnect(); } catch (_) {} }
+  }
+}
+
+/** 어택 후 지수 감쇠하는 타악기형 엔벨로프 */
+function percussiveEnv(param, start, peak, attack, decay) {
+  const a = Math.max(0.002, attack);
+  param.setValueAtTime(0.0001, start);
+  param.linearRampToValueAtTime(peak, start + a);
+  param.exponentialRampToValueAtTime(0.0001, start + Math.max(a + 0.02, decay));
+}
+
+/** 어택 → 지속 → 릴리스 형태의 지속음 엔벨로프 */
+function sustainedEnv(param, start, peak, attack, release, dur) {
+  const a = clamp(attack, 0.005, dur * 0.5);
+  const r = clamp(release, 0.01, dur * 0.5);
+  param.setValueAtTime(0.0001, start);
+  param.linearRampToValueAtTime(peak, start + a);
+  param.setValueAtTime(peak, start + Math.max(a, dur - r));
+  param.linearRampToValueAtTime(0.0001, start + dur);
+}
+
+/**
+ * 색 영역별 악기 정의.
+ * hue: [시작°, 끝°) — 빨강은 345°~25°로 0°를 감싼다.
+ * build(v, p): 보이스를 구성하고 마지막 노드를 반환한다.
+ *   p = { freq, gain, tone, start, dur }  (tone: 채도 0~1 → 음색 밝기)
+ * norm: 음량 정규화 계수. 부분음을 합치면 보이스 피크가 요청 gain을
+ *   1.16~1.60배까지 초과해 색 영역마다 체감 음량이 달라진다.
+ *   OfflineAudioContext로 음높이·채도 전 범위의 최대 피크를 실측한 뒤
+ *   그 역수를 적용해 모든 악기가 요청 gain에 맞춰 울리도록 맞춘다.
+ */
+const INSTRUMENTS = [
+  {
+    id: "marimba", label: "마림바", swatch: "#ef4444", hue: [345, 25],
+    norm: 0.810,
+    desc: "나무 타악 — 빠른 어택, 짧은 감쇠",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      // 마림바는 기음 위 4배·9.2배 부분음이 특징적이다.
+      const o1 = v.osc("sine", p.freq, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 4, 0, p.start, end);
+      const o3 = v.osc("sine", p.freq * 9.2, 0, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.20); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.05); o3.connect(g3); g3.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.004, Math.min(p.dur, 0.6));
+      const lp = v.lowpass(2000 + 3500 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "pluck", label: "플럭 기타", swatch: "#f97316", hue: [25, 55],
+    norm: 0.625,
+    desc: "튕긴 현 — 필터 스윕으로 감쇠",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      const o1 = v.osc("sawtooth", p.freq, -6, p.start, end);
+      const o2 = v.osc("triangle", p.freq, 7, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.55); o2.connect(g2); g2.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.003, Math.min(p.dur, 0.7));
+      // 컷오프를 빠르게 내려 현이 죽어가는 느낌을 만든다.
+      const lp = v.lowpass(3000, 5);
+      lp.frequency.setValueAtTime(2500 + 4500 * p.tone, p.start);
+      lp.frequency.exponentialRampToValueAtTime(420, p.start + Math.min(p.dur, 0.5));
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "bell", label: "차임벨", swatch: "#facc15", hue: [55, 85],
+    norm: 0.711,
+    desc: "비조화 배음 — 긴 여운",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      // 정수배가 아닌 부분음이 종 특유의 금속성을 만든다.
+      for (const [mul, amp] of [[1, 1], [2.0, 0.35], [2.76, 0.26], [5.4, 0.10]]) {
+        const o = v.osc("sine", p.freq * mul, 0, p.start, end);
+        const g = v.gain(amp);
+        o.connect(g); g.connect(v.out);
+      }
+      percussiveEnv(v.out.gain, p.start, p.gain * 0.9, 0.005, p.dur);
+      const lp = v.lowpass(3000 + 5000 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "flute", label: "플루트", swatch: "#22c55e", hue: [85, 150],
+    norm: 0.782,
+    desc: "순한 사인 — 부드러운 어택, 비브라토",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      const o1 = v.osc("sine", p.freq, 0, p.start, end);
+      const o2 = v.osc("triangle", p.freq * 2, 4, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.12); o2.connect(g2); g2.connect(v.out);
+      v.vibrato([o1, o2], 5.2, 7, p.start, end);
+      sustainedEnv(v.out.gain, p.start, p.gain,
+                   Math.min(0.07, p.dur * 0.3), Math.min(0.10, p.dur * 0.35), p.dur);
+      const lp = v.lowpass(1500 + 3000 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "pad", label: "글래스 패드", swatch: "#14b8a6", hue: [150, 195],
+    norm: 0.744,
+    desc: "느린 어택 — 긴 릴리스",
+    build(v, p) {
+      const end = p.start + p.dur + 0.08;
+      const o1 = v.osc("triangle", p.freq, -5, p.start, end);
+      const o2 = v.osc("triangle", p.freq * 2, 6, p.start, end);
+      const o3 = v.osc("sine", p.freq * 3, 0, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.30); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.12); o3.connect(g3); g3.connect(v.out);
+      sustainedEnv(v.out.gain, p.start, p.gain * 0.95, p.dur * 0.45, p.dur * 0.45, p.dur);
+      const lp = v.lowpass(800 + 2600 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "strings", label: "현악 앙상블", swatch: "#2563eb", hue: [195, 245],
+    norm: 0.859,
+    desc: "디튠 톱니 겹침 — 비브라토",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      // 좌우로 디튠한 톱니 두 개를 겹쳐 앙상블의 두께를 만든다.
+      const o1 = v.osc("sawtooth", p.freq, -9, p.start, end);
+      const o2 = v.osc("sawtooth", p.freq, 9, p.start, end);
+      const g1 = v.gain(0.5); o1.connect(g1); g1.connect(v.out);
+      const g2 = v.gain(0.5); o2.connect(g2); g2.connect(v.out);
+      v.vibrato([o1, o2], 5.6, 9, p.start, end);
+      sustainedEnv(v.out.gain, p.start, p.gain,
+                   Math.min(0.09, p.dur * 0.35), Math.min(0.12, p.dur * 0.4), p.dur);
+      const lp = v.lowpass(1100 + 3400 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "brass", label: "금관", swatch: "#8b5cf6", hue: [245, 290],
+    norm: 0.648,
+    desc: "필터 스윕 톱니 — 단단한 어택",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      const o1 = v.osc("sawtooth", p.freq, 0, p.start, end);
+      const o2 = v.osc("sawtooth", p.freq * 2, 5, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.18); o2.connect(g2); g2.connect(v.out);
+      // 컷오프를 열었다 닫으며 금관 특유의 "부는" 윤곽을 만든다.
+      const peakHz = 1600 + 3200 * p.tone;
+      const lp = v.lowpass(350, 3);
+      lp.frequency.setValueAtTime(350, p.start);
+      lp.frequency.linearRampToValueAtTime(peakHz, p.start + Math.min(0.09, p.dur * 0.4));
+      lp.frequency.linearRampToValueAtTime(peakHz * 0.55, p.start + p.dur);
+      sustainedEnv(v.out.gain, p.start, p.gain,
+                   Math.min(0.045, p.dur * 0.25), Math.min(0.09, p.dur * 0.3), p.dur);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "organ", label: "파이프 오르간", swatch: "#ec4899", hue: [290, 345],
+    norm: 0.690,
+    desc: "가산 합성 배음 — 평탄한 지속",
+    build(v, p) {
+      const end = p.start + p.dur + 0.05;
+      const partials = [[1, 1], [2, 0.5], [3, 0.3], [4, 0.22], [6, 0.10]];
+      partials.forEach(([mul, amp], i) => {
+        const o = v.osc("sine", p.freq * mul, i === 2 ? 4 : 0, p.start, end);
+        const g = v.gain(amp);
+        o.connect(g); g.connect(v.out);
+      });
+      sustainedEnv(v.out.gain, p.start, p.gain * 0.8,
+                   Math.min(0.025, p.dur * 0.2), Math.min(0.06, p.dur * 0.25), p.dur);
+      const lp = v.lowpass(2000 + 4000 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  }
+];
+
+/** Hue(0~360) → 담당 악기. 빨강 영역은 0°를 감싸므로 별도 처리한다. */
+function instrumentForHue(h) {
+  const hue = ((h % 360) + 360) % 360;
+  for (const inst of INSTRUMENTS) {
+    const [lo, hi] = inst.hue;
+    const hit = lo <= hi ? (hue >= lo && hue < hi) : (hue >= lo || hue < hi);
+    if (hit) return inst;
+  }
+  return INSTRUMENTS[0];
+}
+
+/* =====================================================================
  * SoundMapper — 색상 파라미터 → 음악 파라미터 변환
  * ===================================================================== */
 const SCALE_INTERVALS = {
@@ -788,17 +1105,20 @@ class SoundMapper {
     return 0.05 + (brightness / 255) * 0.35;
   }
 
-  /** Saturation(0~1) → waveform */
-  saturationToWaveform(s) {
-    const pct = s * 100;
-    if (pct > 66) return "sawtooth";
-    if (pct >= 33) return "triangle";
-    return "sine";
+  /**
+   * Saturation(0~1) → 음색 밝기(tone).
+   * 악기 정체성은 Hue가 결정하므로, 채도는 같은 악기 안에서
+   * 저역통과 컷오프를 밀어올려 밝기를 조절한다.
+   * 채도가 높을수록 배음이 살아 밝고, 낮을수록 부드럽고 둔탁해진다.
+   */
+  saturationToTone(s) {
+    return clamp(s, 0, 1);
   }
 
   /**
    * 분석 결과를 노트 목록으로 변환.
-   * @returns {Array<{col:number, band:number, freq:number, gain:number, type:OscillatorType}>}
+   * @returns {Array<{col:number, band:number, freq:number, gain:number,
+   *                  tone:number, inst:object}>}
    */
   toNotes(grid) {
     const notes = [];
@@ -809,7 +1129,8 @@ class SoundMapper {
           col, band,
           freq: this.hueToFrequency(cell.h),
           gain: this.brightnessToGain(cell.brightness),
-          type: this.saturationToWaveform(cell.s)
+          tone: this.saturationToTone(cell.s),
+          inst: instrumentForHue(cell.h)
         });
       });
     });
@@ -825,7 +1146,7 @@ class AudioScheduler {
     this.ctx = null;
     this.master = null;
     this.analyser = null;
-    this.nodes = [];       // 재생 중인 {osc, gain} 목록
+    this.voices = [];      // 예약된 Voice 목록
     this.startTime = 0;
     this.duration = 0;
     this.playing = false;
@@ -870,36 +1191,33 @@ class AudioScheduler {
    */
   schedule(notes, stepDuration, cols) {
     const ctx = this.ctx;
-    const t0 = ctx.currentTime + 0.12;   // 스케줄링 여유
+    // 악기 보이스는 노트당 여러 노드를 만들므로 그래프 구성에 시간이 걸린다.
+    // 리드타임이 그 시간보다 짧으면 첫 열이 과거 시각에 예약돼 한꺼번에
+    // 터져 나오므로, 노트 수에 비례해 여유를 잡는다(실측 약 0.5ms/노트).
+    const lead = clamp(0.12 + notes.length * 0.0012, 0.12, 0.6);
+    const t0 = ctx.currentTime + lead;
     const noteLen = Math.min(stepDuration * 1.9, 0.9);
-    const attack = Math.min(0.02, noteLen * 0.15);
-    const decay = Math.max(0.04, noteLen * 0.35);
 
     this.stopAllNodes();
 
     for (const n of notes) {
       const start = t0 + n.col * stepDuration;
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = n.type;
-      osc.frequency.setValueAtTime(n.freq, start);
+      const voice = new Voice(ctx);
+      // 음색 구성은 색 영역이 지정한 악기에 위임한다.
+      const tail = n.inst.build(voice, {
+        freq: n.freq,
+        gain: n.gain * (n.inst.norm || 1),
+        tone: n.tone,
+        start,
+        dur: noteLen
+      });
+      tail.connect(this.master);
 
-      // 단순화 ADSR(attack → decay/release)로 클릭 노이즈 방지
-      g.gain.setValueAtTime(0.0001, start);
-      g.gain.linearRampToValueAtTime(n.gain, start + attack);
-      g.gain.linearRampToValueAtTime(n.gain * 0.6, start + attack + decay * 0.5);
-      g.gain.linearRampToValueAtTime(0.0001, start + noteLen);
+      // 자연 종료 시 그래프에서 스스로 떨어져 나오도록 한다.
+      const primary = voice.sources[0];
+      if (primary) primary.onended = () => voice.dispose();
 
-      osc.connect(g);
-      g.connect(this.master);
-      osc.start(start);
-      osc.stop(start + noteLen + 0.02);
-
-      const entry = { osc, gain: g };
-      osc.onended = () => {
-        try { g.disconnect(); osc.disconnect(); } catch (_) {}
-      };
-      this.nodes.push(entry);
+      this.voices.push(voice);
     }
 
     this.startTime = t0;
@@ -908,19 +1226,14 @@ class AudioScheduler {
     return { startTime: t0, duration: this.duration };
   }
 
-  /** 예약된 모든 오실레이터를 즉시 stop() · disconnect() */
+  /** 예약된 모든 보이스를 즉시 stop() · disconnect() */
   stopAllNodes() {
     const now = this.ctx ? this.ctx.currentTime : 0;
-    for (const { osc, gain } of this.nodes) {
-      try {
-        gain.gain.cancelScheduledValues(now);
-        gain.gain.setValueAtTime(0.0001, now);
-        osc.onended = null;
-        osc.stop(now);
-      } catch (_) { /* 이미 종료된 노드 */ }
-      try { osc.disconnect(); gain.disconnect(); } catch (_) {}
+    for (const voice of this.voices) {
+      voice.silence(now);
+      voice.dispose();
     }
-    this.nodes = [];
+    this.voices = [];
   }
 
   stop() {
@@ -1101,6 +1414,37 @@ class Visualizer {
     swatchRow.appendChild(btn);
   });
 
+  /* ── 악기 범례 (INSTRUMENTS에서 생성해 정의와 어긋날 수 없게 한다) ── */
+  const instList = $("instList");
+  INSTRUMENTS.forEach((inst) => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "inst-btn";
+    btn.setAttribute("aria-label", `${inst.label} 색으로 그리기`);
+
+    const dot = document.createElement("span");
+    dot.className = "inst-dot";
+    dot.style.background = inst.swatch;
+
+    const body = document.createElement("span");
+    const name = document.createElement("span");
+    name.className = "inst-name";
+    name.textContent = inst.label;
+    const hue = document.createElement("span");
+    hue.className = "inst-hue";
+    hue.textContent = `${inst.hue[0]}°–${inst.hue[1]}°`;
+    const desc = document.createElement("small");
+    desc.className = "inst-desc";
+    desc.textContent = inst.desc;
+    body.append(name, hue, desc);
+
+    btn.append(dot, body);
+    btn.addEventListener("click", () => selectColor(inst.swatch));
+    li.appendChild(btn);
+    instList.appendChild(li);
+  });
+
   function selectColor(hex) {
     engine.setColor(hex);
     colorPicker.value = hex;
@@ -1192,8 +1536,12 @@ class Visualizer {
     canvasWrap.classList.add("is-playing");
     playBtn.disabled = true;
     stopBtn.disabled = false;
+    // 어떤 악기가 울리는지 알려준다 — 색 영역 매핑을 귀로 확인하기 위한 단서.
+    const usedIds = new Set(notes.map((n) => n.inst.id));
+    const used = INSTRUMENTS.filter((i) => usedIds.has(i.id)).map((i) => i.label);
     setStatus(`재생 중 — 노트 ${notes.length}개, 길이 ${duration.toFixed(1)}초, ` +
-              `${scaleSelect.options[scaleSelect.selectedIndex].text.split(" ")[0]} 스케일`);
+              `${scaleSelect.options[scaleSelect.selectedIndex].text.split(" ")[0]} 스케일 · ` +
+              `악기 ${used.length}종(${used.join(", ")})`);
 
     viz.startLoop(
       () => {
