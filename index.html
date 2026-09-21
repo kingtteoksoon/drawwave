@@ -229,6 +229,24 @@
   .legend dt { font-weight: 600; color: var(--text); margin-top: 6px; }
   .legend dd { margin: 0 0 2px; }
 
+  .audio-check {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .audio-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .audio-row b { color: var(--text); font-weight: 600; }
+  .audio-row b.ok   { color: var(--accent); }
+  .audio-row b.warn { color: var(--danger); }
+  #testToneBtn { width: 100%; }
+
   .inst-list {
     list-style: none;
     margin: 0;
@@ -355,6 +373,19 @@
       </div>
 
       <p id="status" role="status" aria-live="polite">정지됨. 그림을 그린 뒤 재생을 누르세요.</p>
+
+      <div class="audio-check">
+        <div class="audio-row">
+          <span>오디오 출력</span>
+          <b id="audioState">재생 시 확인</b>
+        </div>
+        <button type="button" id="testToneBtn">테스트 음 (440Hz, 1초)</button>
+        <p class="legend" id="audioHint" style="margin:7px 0 0">
+          소리가 안 들리면 먼저 테스트 음을 눌러보세요. 파형이 움직이는데 소리가
+          없다면 브라우저 탭 음소거·시스템 볼륨·출력 장치 문제입니다.
+          iPhone은 측면 무음 스위치가 켜져 있으면 들리지 않습니다.
+        </p>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="scope-heading">
@@ -811,6 +842,24 @@ class ImageAnalyzer {
  * 직접 합성한다(외부 샘플·라이브러리 없음 — CSP 제약 유지).
  * ===================================================================== */
 
+/**
+ * 지수 감쇠 노이즈로 리버브 임펄스 응답을 만든다.
+ * @param {number} seconds 잔향 길이
+ * @param {number} decay   감쇠 지수(클수록 빨리 잦아듦)
+ */
+function makeImpulseResponse(ctx, seconds, decay) {
+  const rate = ctx.sampleRate;
+  const len = Math.max(1, Math.floor(rate * seconds));
+  const buf = ctx.createBuffer(2, len, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+    }
+  }
+  return buf;
+}
+
 /** 한 음(보이스)을 구성하는 노드 묶음. 생성·정지·해제를 함께 관리한다. */
 class Voice {
   constructor(ctx) {
@@ -861,6 +910,19 @@ class Voice {
     this.sources.push(lfo);
   }
 
+  /** 진폭 LFO를 게인 노드에 연결(비브라폰 트레몰로 등) */
+  tremolo(node, rate, depth, start, end) {
+    const lfo = this.ctx.createOscillator();
+    lfo.type = "sine";
+    lfo.frequency.value = rate;
+    const d = this.gain(depth);
+    lfo.connect(d);
+    d.connect(node.gain);
+    lfo.start(start);
+    lfo.stop(end);
+    this.sources.push(lfo);
+  }
+
   /** 즉시 묵음화 후 모든 소스 정지 */
   silence(now) {
     try {
@@ -906,160 +968,182 @@ function sustainedEnv(param, start, peak, attack, release, dur) {
  *   OfflineAudioContext로 음높이·채도 전 범위의 최대 피크를 실측한 뒤
  *   그 역수를 적용해 모든 악기가 요청 gain에 맞춰 울리도록 맞춘다.
  */
+/**
+ * 색 영역별 악기 — 하나의 앙상블로 어울리도록 설계.
+ *
+ * Hue는 악기와 음높이를 함께 결정한다(0°가 최저음, 360°가 최고음).
+ * 따라서 각 악기를 자기가 실제로 연주하게 될 음역에 맞춰 배치했다.
+ * 빨강·주황은 따뜻하고 둥근 저음 악기, 노랑·초록은 중음 멜로디,
+ * 청록·파랑은 지속하는 중고음 바탕, 보라·자홍은 맑고 섬세한 고음이다.
+ *
+ * 섞임을 위해 세 가지를 지켰다.
+ *  - 배음은 낮은 차수 위주. 날것의 톱니와 비조화 부분음을 쓰지 않는다.
+ *  - 어택은 모두 완만하게. 한 악기가 튀어나와 앞을 가리지 않는다.
+ *  - 지속형과 감쇠형을 번갈아 배치해 서로의 빈자리를 채운다.
+ */
 const INSTRUMENTS = [
   {
-    id: "marimba", label: "마림바", swatch: "#ef4444", hue: [345, 25],
-    norm: 0.810,
-    desc: "나무 타악 — 빠른 어택, 짧은 감쇠",
+    id: "rhodes", label: "일렉트릭 피아노", swatch: "#ef4444", hue: [345, 25],
+    norm: 0.770,
+    desc: "최저음역 — 따뜻한 기음에 짧은 종음 어택",
     build(v, p) {
       const end = p.start + p.dur + 0.05;
-      // 마림바는 기음 위 4배·9.2배 부분음이 특징적이다.
       const o1 = v.osc("sine", p.freq, 0, p.start, end);
-      const o2 = v.osc("sine", p.freq * 4, 0, p.start, end);
-      const o3 = v.osc("sine", p.freq * 9.2, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 2, 0, p.start, end);
+      const o3 = v.osc("sine", p.freq * 4.01, 0, p.start, end);
       o1.connect(v.out);
-      const g2 = v.gain(0.20); o2.connect(g2); g2.connect(v.out);
-      const g3 = v.gain(0.05); o3.connect(g3); g3.connect(v.out);
-      percussiveEnv(v.out.gain, p.start, p.gain, 0.004, Math.min(p.dur, 0.6));
-      const lp = v.lowpass(2000 + 3500 * p.tone);
+      const g2 = v.gain(0.18); o2.connect(g2); g2.connect(v.out);
+      // 4배음은 어택에서만 울리고 빨리 사라진다 — 로즈 특유의 "탱" 하는 머리
+      const g3 = v.gain(0); o3.connect(g3); g3.connect(v.out);
+      g3.gain.setValueAtTime(0.0001, p.start);
+      g3.gain.linearRampToValueAtTime(0.22, p.start + 0.006);
+      g3.gain.exponentialRampToValueAtTime(0.0001, p.start + Math.min(p.dur, 0.18));
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.006, Math.min(p.dur, 0.75));
+      const lp = v.lowpass(1200 + 2200 * p.tone);
       v.out.connect(lp);
       return lp;
     }
   },
   {
-    id: "pluck", label: "플럭 기타", swatch: "#f97316", hue: [25, 55],
-    norm: 0.625,
-    desc: "튕긴 현 — 필터 스윕으로 감쇠",
+    id: "cello", label: "첼로", swatch: "#f97316", hue: [25, 55],
+    norm: 0.959,
+    desc: "저음역 — 활로 켜는 지속음, 낮게 필터링해 따뜻하게",
     build(v, p) {
       const end = p.start + p.dur + 0.05;
       const o1 = v.osc("sawtooth", p.freq, -6, p.start, end);
-      const o2 = v.osc("triangle", p.freq, 7, p.start, end);
-      o1.connect(v.out);
-      const g2 = v.gain(0.55); o2.connect(g2); g2.connect(v.out);
-      percussiveEnv(v.out.gain, p.start, p.gain, 0.003, Math.min(p.dur, 0.7));
-      // 컷오프를 빠르게 내려 현이 죽어가는 느낌을 만든다.
-      const lp = v.lowpass(3000, 5);
-      lp.frequency.setValueAtTime(2500 + 4500 * p.tone, p.start);
-      lp.frequency.exponentialRampToValueAtTime(420, p.start + Math.min(p.dur, 0.5));
+      const o2 = v.osc("sawtooth", p.freq, 6, p.start, end);
+      const g1 = v.gain(0.5); o1.connect(g1); g1.connect(v.out);
+      const g2 = v.gain(0.5); o2.connect(g2); g2.connect(v.out);
+      v.vibrato([o1, o2], 4.8, 6, p.start, end);
+      sustainedEnv(v.out.gain, p.start, p.gain,
+                   Math.min(0.12, p.dur * 0.4), Math.min(0.14, p.dur * 0.4), p.dur);
+      // 컷오프를 낮게 잡아 톱니의 거친 배음을 걷어낸다.
+      const lp = v.lowpass(700 + 1500 * p.tone, 0.9);
       v.out.connect(lp);
       return lp;
     }
   },
   {
-    id: "bell", label: "차임벨", swatch: "#facc15", hue: [55, 85],
-    norm: 0.711,
-    desc: "비조화 배음 — 긴 여운",
+    id: "nylon", label: "나일론 기타", swatch: "#facc15", hue: [55, 85],
+    norm: 0.951,
+    desc: "저중음역 — 부드럽게 튕긴 현",
     build(v, p) {
       const end = p.start + p.dur + 0.05;
-      // 정수배가 아닌 부분음이 종 특유의 금속성을 만든다.
-      for (const [mul, amp] of [[1, 1], [2.0, 0.35], [2.76, 0.26], [5.4, 0.10]]) {
-        const o = v.osc("sine", p.freq * mul, 0, p.start, end);
-        const g = v.gain(amp);
-        o.connect(g); g.connect(v.out);
-      }
-      percussiveEnv(v.out.gain, p.start, p.gain * 0.9, 0.005, p.dur);
-      const lp = v.lowpass(3000 + 5000 * p.tone);
+      const o1 = v.osc("triangle", p.freq, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 2, 4, p.start, end);
+      const o3 = v.osc("triangle", p.freq * 3, -3, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.25); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.08); o3.connect(g3); g3.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.005, Math.min(p.dur, 0.6));
+      const lp = v.lowpass(2200, 1);
+      lp.frequency.setValueAtTime(2200 + 2000 * p.tone, p.start);
+      lp.frequency.exponentialRampToValueAtTime(700, p.start + Math.min(p.dur, 0.5));
       v.out.connect(lp);
       return lp;
     }
   },
   {
-    id: "flute", label: "플루트", swatch: "#22c55e", hue: [85, 150],
-    norm: 0.782,
-    desc: "순한 사인 — 부드러운 어택, 비브라토",
+    id: "woodflute", label: "나무 플루트", swatch: "#22c55e", hue: [85, 150],
+    norm: 0.775,
+    desc: "중음역 — 숨결 같은 어택, 완만한 비브라토",
     build(v, p) {
       const end = p.start + p.dur + 0.05;
       const o1 = v.osc("sine", p.freq, 0, p.start, end);
       const o2 = v.osc("triangle", p.freq * 2, 4, p.start, end);
-      o1.connect(v.out);
-      const g2 = v.gain(0.12); o2.connect(g2); g2.connect(v.out);
-      v.vibrato([o1, o2], 5.2, 7, p.start, end);
-      sustainedEnv(v.out.gain, p.start, p.gain,
-                   Math.min(0.07, p.dur * 0.3), Math.min(0.10, p.dur * 0.35), p.dur);
-      const lp = v.lowpass(1500 + 3000 * p.tone);
-      v.out.connect(lp);
-      return lp;
-    }
-  },
-  {
-    id: "pad", label: "글래스 패드", swatch: "#14b8a6", hue: [150, 195],
-    norm: 0.744,
-    desc: "느린 어택 — 긴 릴리스",
-    build(v, p) {
-      const end = p.start + p.dur + 0.08;
-      const o1 = v.osc("triangle", p.freq, -5, p.start, end);
-      const o2 = v.osc("triangle", p.freq * 2, 6, p.start, end);
       const o3 = v.osc("sine", p.freq * 3, 0, p.start, end);
       o1.connect(v.out);
-      const g2 = v.gain(0.30); o2.connect(g2); g2.connect(v.out);
-      const g3 = v.gain(0.12); o3.connect(g3); g3.connect(v.out);
-      sustainedEnv(v.out.gain, p.start, p.gain * 0.95, p.dur * 0.45, p.dur * 0.45, p.dur);
-      const lp = v.lowpass(800 + 2600 * p.tone);
-      v.out.connect(lp);
-      return lp;
-    }
-  },
-  {
-    id: "strings", label: "현악 앙상블", swatch: "#2563eb", hue: [195, 245],
-    norm: 0.859,
-    desc: "디튠 톱니 겹침 — 비브라토",
-    build(v, p) {
-      const end = p.start + p.dur + 0.05;
-      // 좌우로 디튠한 톱니 두 개를 겹쳐 앙상블의 두께를 만든다.
-      const o1 = v.osc("sawtooth", p.freq, -9, p.start, end);
-      const o2 = v.osc("sawtooth", p.freq, 9, p.start, end);
-      const g1 = v.gain(0.5); o1.connect(g1); g1.connect(v.out);
-      const g2 = v.gain(0.5); o2.connect(g2); g2.connect(v.out);
-      v.vibrato([o1, o2], 5.6, 9, p.start, end);
+      const g2 = v.gain(0.10); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.05); o3.connect(g3); g3.connect(v.out);
+      v.vibrato([o1, o2], 5.0, 6, p.start, end);
       sustainedEnv(v.out.gain, p.start, p.gain,
-                   Math.min(0.09, p.dur * 0.35), Math.min(0.12, p.dur * 0.4), p.dur);
-      const lp = v.lowpass(1100 + 3400 * p.tone);
+                   Math.min(0.08, p.dur * 0.32), Math.min(0.10, p.dur * 0.35), p.dur);
+      const lp = v.lowpass(1400 + 2000 * p.tone);
       v.out.connect(lp);
       return lp;
     }
   },
   {
-    id: "brass", label: "금관", swatch: "#8b5cf6", hue: [245, 290],
-    norm: 0.648,
-    desc: "필터 스윕 톱니 — 단단한 어택",
+    id: "vibraphone", label: "비브라폰", swatch: "#14b8a6", hue: [150, 195],
+    norm: 0.808,
+    desc: "중음역 — 금속 건반의 트레몰로와 긴 감쇠",
     build(v, p) {
-      const end = p.start + p.dur + 0.05;
-      const o1 = v.osc("sawtooth", p.freq, 0, p.start, end);
-      const o2 = v.osc("sawtooth", p.freq * 2, 5, p.start, end);
+      const end = p.start + p.dur + 0.08;
+      // 비브라폰은 마림바와 같은 1·4·10배 부분음이되 금속이라 훨씬 오래 운다.
+      const o1 = v.osc("sine", p.freq, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 4, 0, p.start, end);
+      const o3 = v.osc("sine", p.freq * 10, 0, p.start, end);
       o1.connect(v.out);
-      const g2 = v.gain(0.18); o2.connect(g2); g2.connect(v.out);
-      // 컷오프를 열었다 닫으며 금관 특유의 "부는" 윤곽을 만든다.
-      const peakHz = 1600 + 3200 * p.tone;
-      const lp = v.lowpass(350, 3);
-      lp.frequency.setValueAtTime(350, p.start);
-      lp.frequency.linearRampToValueAtTime(peakHz, p.start + Math.min(0.09, p.dur * 0.4));
-      lp.frequency.linearRampToValueAtTime(peakHz * 0.55, p.start + p.dur);
-      sustainedEnv(v.out.gain, p.start, p.gain,
-                   Math.min(0.045, p.dur * 0.25), Math.min(0.09, p.dur * 0.3), p.dur);
+      const g2 = v.gain(0.16); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.04); o3.connect(g3); g3.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.006, Math.min(p.dur, 0.95));
+      // 트레몰로 — 비브라폰의 회전 날개가 만드는 진동
+      const trem = v.gain(1);
+      v.tremolo(trem, 5.5, 0.22, p.start, end);
+      v.out.connect(trem);
+      const lp = v.lowpass(2500 + 2500 * p.tone);
+      trem.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "stringpad", label: "현악 패드", swatch: "#2563eb", hue: [195, 245],
+    norm: 1.089,
+    desc: "중고음역 — 느리게 부풀어 오르는 바탕",
+    build(v, p) {
+      const end = p.start + p.dur + 0.08;
+      const o1 = v.osc("sawtooth", p.freq, -8, p.start, end);
+      const o2 = v.osc("sawtooth", p.freq, 8, p.start, end);
+      const o3 = v.osc("sine", p.freq, 0, p.start, end);
+      const g1 = v.gain(0.4); o1.connect(g1); g1.connect(v.out);
+      const g2 = v.gain(0.4); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.3); o3.connect(g3); g3.connect(v.out);   // 사인으로 심을 채움
+      v.vibrato([o1, o2], 5.2, 5, p.start, end);
+      sustainedEnv(v.out.gain, p.start, p.gain, p.dur * 0.4, p.dur * 0.4, p.dur);
+      const lp = v.lowpass(900 + 2200 * p.tone, 0.8);
       v.out.connect(lp);
       return lp;
     }
   },
   {
-    id: "organ", label: "파이프 오르간", swatch: "#ec4899", hue: [290, 345],
-    norm: 0.690,
-    desc: "가산 합성 배음 — 평탄한 지속",
+    id: "celesta", label: "첼레스타", swatch: "#8b5cf6", hue: [245, 290],
+    norm: 1.045,
+    desc: "고음역 — 짧고 맑은 금속 건반",
     build(v, p) {
       const end = p.start + p.dur + 0.05;
-      const partials = [[1, 1], [2, 0.5], [3, 0.3], [4, 0.22], [6, 0.10]];
-      partials.forEach(([mul, amp], i) => {
-        const o = v.osc("sine", p.freq * mul, i === 2 ? 4 : 0, p.start, end);
-        const g = v.gain(amp);
-        o.connect(g); g.connect(v.out);
-      });
-      sustainedEnv(v.out.gain, p.start, p.gain * 0.8,
-                   Math.min(0.025, p.dur * 0.2), Math.min(0.06, p.dur * 0.25), p.dur);
-      const lp = v.lowpass(2000 + 4000 * p.tone);
+      const o1 = v.osc("sine", p.freq, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 3, 0, p.start, end);
+      const o3 = v.osc("sine", p.freq * 5, 0, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.12); o2.connect(g2); g2.connect(v.out);
+      const g3 = v.gain(0.04); o3.connect(g3); g3.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.004, Math.min(p.dur, 0.5));
+      const lp = v.lowpass(3000 + 3000 * p.tone);
+      v.out.connect(lp);
+      return lp;
+    }
+  },
+  {
+    id: "musicbox", label: "뮤직박스", swatch: "#ec4899", hue: [290, 345],
+    norm: 0.881,
+    desc: "최고음역 — 얇은 음에 긴 여운",
+    build(v, p) {
+      const end = p.start + p.dur + 0.08;
+      const o1 = v.osc("sine", p.freq, 0, p.start, end);
+      const o2 = v.osc("sine", p.freq * 2, 0, p.start, end);
+      const o3 = v.osc("sine", p.freq * 5.4, 0, p.start, end);
+      o1.connect(v.out);
+      const g2 = v.gain(0.20); o2.connect(g2); g2.connect(v.out);
+      // 비조화 부분음은 아주 옅게만 — 금속의 기척만 남기고 충돌은 피한다.
+      const g3 = v.gain(0.035); o3.connect(g3); g3.connect(v.out);
+      percussiveEnv(v.out.gain, p.start, p.gain, 0.003, Math.min(p.dur, 0.85));
+      const lp = v.lowpass(3500 + 3000 * p.tone);
       v.out.connect(lp);
       return lp;
     }
   }
 ];
+
 
 /** Hue(0~360) → 담당 악기. 빨강 영역은 0°를 감싸므로 별도 처리한다. */
 function instrumentForHue(h) {
@@ -1175,12 +1259,87 @@ class AudioScheduler {
       this.analyser.fftSize = 2048;
       this.analyser.smoothingTimeConstant = 0.6;
 
-      this.master.connect(this.limiter);
+      // 공용 리버브 — 서로 다른 악기를 같은 공간에 놓아 앙상블로 묶는다.
+      // 임펄스 응답은 지수 감쇠 노이즈로 생성한다(외부 파일 없음).
+      this.reverb = this.ctx.createConvolver();
+      this.reverb.buffer = makeImpulseResponse(this.ctx, 1.6, 2.4);
+      this.dry = this.ctx.createGain();
+      this.dry.gain.value = 0.80;
+      this.wet = this.ctx.createGain();
+      this.wet.gain.value = 0.26;
+
+      this.master.connect(this.dry);
+      this.dry.connect(this.limiter);
+      this.master.connect(this.reverb);
+      this.reverb.connect(this.wet);
+      this.wet.connect(this.limiter);
+
       this.limiter.connect(this.analyser);
       this.analyser.connect(this.ctx.destination);
+
+      // iOS Safari는 사용자 제스처 안에서 노드가 한 번 울려야 컨텍스트를
+      // 완전히 연다. 무음 오실레이터를 즉시 울려 잠금을 푼다.
+      this.unlock();
     }
-    if (this.ctx.state === "suspended") await this.ctx.resume();
+
+    // Safari는 suspended 외에 interrupted 상태도 사용한다(통화·다른 앱 점유 등).
+    if (this.ctx.state !== "running") {
+      try { await this.ctx.resume(); } catch (_) { /* 아래에서 상태로 판정 */ }
+    }
+    if (this.ctx.state !== "running") {
+      throw new Error(
+        `오디오가 차단됐습니다(상태: ${this.ctx.state}). ` +
+        `페이지를 한 번 클릭한 뒤 다시 재생해 주세요.`);
+    }
     return this.ctx;
+  }
+
+  /** 제스처 중 무음 노드를 한 번 울려 오디오 출력을 여는 잠금 해제 절차 */
+  unlock() {
+    try {
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      g.gain.value = 0;
+      o.connect(g);
+      g.connect(this.ctx.destination);
+      o.start();
+      o.stop(this.ctx.currentTime + 0.01);
+      o.onended = () => { try { o.disconnect(); g.disconnect(); } catch (_) {} };
+    } catch (_) { /* 잠금 해제 실패는 아래 상태 검사에서 드러난다 */ }
+  }
+
+  /** 현재 오디오 출력 상태 요약 (진단용) */
+  describe() {
+    if (!this.ctx) return { state: "미생성", sampleRate: null };
+    return {
+      state: this.ctx.state,
+      sampleRate: this.ctx.sampleRate,
+      currentTime: this.ctx.currentTime
+    };
+  }
+
+  /**
+   * 1초짜리 기준음(A4 440Hz)을 마스터 경로로 재생한다.
+   * 앱 로직과 브라우저·기기 출력 문제를 분리하기 위한 진단 수단.
+   */
+  async testTone() {
+    await this.ensureContext();
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.05;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(440, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.3, t + 0.02);
+    g.gain.setValueAtTime(0.3, t + 0.8);
+    g.gain.linearRampToValueAtTime(0.0001, t + 1.0);
+    o.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + 1.05);
+    o.onended = () => { try { o.disconnect(); g.disconnect(); } catch (_) {} };
+    return { startedAt: t, state: ctx.state, sampleRate: ctx.sampleRate };
   }
 
   /**
@@ -1334,6 +1493,25 @@ class Visualizer {
     this.raf = requestAnimationFrame(tick);
   }
 
+  /**
+   * 지정한 시간 동안 파형만 렌더링한다(테스트 음 확인용).
+   * 파형이 움직이는데 소리가 없다면 원인은 앱이 아니라 기기·브라우저 출력이다.
+   */
+  scopeOnly(analyser, ms) {
+    this.stopLoop();
+    const end = performance.now() + ms;
+    const tick = () => {
+      this.drawScope(analyser);
+      if (performance.now() >= end) {
+        this.raf = null;
+        this.drawScope(null);
+        return;
+      }
+      this.raf = requestAnimationFrame(tick);
+    };
+    this.raf = requestAnimationFrame(tick);
+  }
+
   stopLoop() {
     if (this.raf !== null) {
       cancelAnimationFrame(this.raf);
@@ -1365,6 +1543,8 @@ class Visualizer {
   const progressFill  = $("progressFill");
   const progressValue = $("progressValue");
   const progressBar   = $("progressBar");
+  const audioState = $("audioState");
+  const testToneBtn = $("testToneBtn");
   const clearBtn   = $("clearBtn");
   const uploadBtn  = $("uploadBtn");
   const fileInput  = $("fileInput");
@@ -1505,6 +1685,41 @@ class Visualizer {
     fileInput.value = "";
   });
 
+  /* ── 오디오 출력 진단 ─────────────────────────────────── */
+  function showAudioState(text, kind) {
+    audioState.textContent = text;
+    audioState.className = kind || "";
+  }
+
+  /** AudioContext 상태를 사람이 읽을 수 있는 문구로 옮긴다. */
+  function reportAudioState() {
+    const d = scheduler.describe();
+    if (d.state === "running") {
+      showAudioState(`정상 (${Math.round(d.sampleRate / 1000)}kHz)`, "ok");
+    } else if (d.state === "미생성") {
+      showAudioState("재생 시 확인", "");
+    } else {
+      showAudioState(`차단됨 (${d.state})`, "warn");
+    }
+  }
+
+  testToneBtn.addEventListener("click", async () => {
+    testToneBtn.disabled = true;
+    try {
+      const r = await scheduler.testTone();
+      reportAudioState();
+      // 파형을 함께 띄워 "신호는 나가는데 안 들리는" 경우를 눈으로 구분하게 한다.
+      viz.scopeOnly(scheduler.analyser, 1200);
+      setStatus(`테스트 음을 재생했습니다 (440Hz · ${Math.round(r.sampleRate / 1000)}kHz). ` +
+                `아래 파형이 움직이는데 소리가 없다면 탭 음소거·시스템 볼륨·출력 장치 문제입니다.`);
+    } catch (err) {
+      showAudioState("차단됨", "warn");
+      setStatus(err.message);
+    } finally {
+      setTimeout(() => { testToneBtn.disabled = false; }, 1100);
+    }
+  });
+
   /* ── 재생 / 정지 ──────────────────────────────────────── */
   playBtn.addEventListener("click", startPlayback);
   stopBtn.addEventListener("click", () => {
@@ -1516,7 +1731,9 @@ class Visualizer {
     if (scheduler.playing) return;
     try {
       await scheduler.ensureContext();
+      reportAudioState();
     } catch (err) {
+      showAudioState("차단됨", "warn");
       setStatus(err.message);
       return;
     }
@@ -1543,6 +1760,16 @@ class Visualizer {
               `${scaleSelect.options[scaleSelect.selectedIndex].text.split(" ")[0]} 스케일 · ` +
               `악기 ${used.length}종(${used.join(", ")})`);
 
+    // 컨텍스트가 중간에 멈추면 currentTime이 진행하지 않아 조용히 정지한 것처럼
+    // 보인다. 1.2초 뒤에도 진행률이 0이면 원인을 상태 영역에 알린다.
+    const stallCheck = setTimeout(() => {
+      if (scheduler.playing && scheduler.progress() === 0) {
+        reportAudioState();
+        setStatus("오디오 시계가 진행되지 않습니다. 브라우저가 소리를 차단한 상태일 수 있습니다. " +
+                  "페이지를 한 번 클릭한 뒤 다시 재생하거나 테스트 음으로 출력을 확인해 주세요.");
+      }
+    }, 1200);
+
     viz.startLoop(
       () => {
         const p = scheduler.progress();
@@ -1551,13 +1778,21 @@ class Visualizer {
       },
       scheduler.analyser,
       () => {
+        clearTimeout(stallCheck);
         finishPlayback();
         setStatus("재생이 끝났습니다.");
       }
     );
+    pendingStallCheck = stallCheck;
   }
 
+  let pendingStallCheck = null;
+
   function stopPlayback() {
+    if (pendingStallCheck !== null) {
+      clearTimeout(pendingStallCheck);
+      pendingStallCheck = null;
+    }
     scheduler.stop();
     finishPlayback();
   }
